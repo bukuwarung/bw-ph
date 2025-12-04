@@ -5,7 +5,6 @@ services:
     build: .
     container_name: bukuwarung-voice-api
     ports:
-      - "9000:9000"
       - "8765:8765"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
@@ -13,14 +12,5 @@ services:
       - BUKUWARUNG_TOKEN=${BUKUWARUNG_TOKEN}
       - BUKUWARUNG_SESSION=${BUKUWARUNG_SESSION}
     volumes:
-      # Mount static files for development
       - ./static:/app/static
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    # Use host network mode for better WebSocket performance (optional)
-    # network_mode: "host"  # Uncomment if you have WebSocket issues

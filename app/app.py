@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 BukuWarung Transaction History - FastAPI + Gemini Live Voice Integration
-Runs both REST API (port 9000) and WebSocket server (port 8765)
+Unified Server running REST API and WebSocket on Port 8765 using socket sharing.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
@@ -18,6 +18,9 @@ import asyncio
 import json
 import base64
 import websockets
+import uvicorn
+import uvicorn.protocols.http.h11_impl
+import socket # New import for socket sharing
 
 # Import Gemini client library
 from google import genai
@@ -27,7 +30,7 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 # ==================== CONFIGURATION ====================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -36,12 +39,21 @@ BUKUWARUNG_TOKEN = os.getenv("BUKUWARUNG_TOKEN", "")
 BUKUWARUNG_SESSION = os.getenv("BUKUWARUNG_SESSION", "")
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
+# Unified Server Port
+SINGLE_PORT = 8765
+HOST = "0.0.0.0"
+
 # Initialize Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_ID = "gemini-2.0-flash-exp"
 LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
 
-# ==================== DATE PARSER ====================
+# ==================== TRANSACTION & DATE PARSING FUNCTIONS ====================
+
+# [Keep your existing PARSE_DATE_RANGE_FUNCTION, calculate_date_range, 
+#  parse_time_reference_with_gemini, format_datetime_for_api, 
+#  summarize_transactions, query_transaction_history, and TRANSACTION_FUNCTIONS 
+#  here without modification.]
 
 PARSE_DATE_RANGE_FUNCTION = {
     "name": "parse_date_range",
@@ -189,8 +201,6 @@ def format_datetime_for_api(dt: datetime) -> str:
     dt_no_micro = dt.replace(microsecond=0)
     return dt_no_micro.strftime("%Y-%m-%dT%H:%M:%S+07:00")
 
-# ==================== TRANSACTION FUNCTIONS ====================
-
 def summarize_transactions(transactions: List[dict], transaction_type: str, time_period: str) -> dict:
     """Summarize transaction data"""
     if not transactions:
@@ -295,7 +305,6 @@ def query_transaction_history(
             "summary": {}
         }
 
-# Transaction function declarations for Gemini
 TRANSACTION_FUNCTIONS = [
     {
         "name": "query_transaction_history",
@@ -323,7 +332,7 @@ TRANSACTION_FUNCTIONS = [
     }
 ]
 
-# ==================== GEMINI LIVE WEBSOCKET SERVER ====================
+# ==================== GEMINI LIVE WEBSOCKET HANDLER ====================
 
 class ClientWebSocketHandler:
     """WebSocket server for voice clients to connect"""
@@ -344,10 +353,8 @@ class ClientWebSocketHandler:
             config = {
                 "response_modalities": ["AUDIO"],
                 "system_instruction": """You are a friendly transaction history assistant for BukuWarung EDC merchants in Indonesia.
-
 When users ask about their transaction history, use the query_transaction_history function and provide clear summaries.
 Always use this format: "{Time period}, you made {count} transfers totaling {amount}. This included {provider breakdown}."
-
 Be concise and natural in voice. Answer in Indonesian language.""",
                 "tools": tools
             }
@@ -373,13 +380,11 @@ Be concise and natural in voice. Answer in Indonesian language.""",
                     self._handle_client_messages(websocket, session)
                 )
                 
-                # Wait for either task to complete
                 done, pending = await asyncio.wait(
                     [receiving_task, handling_task],
                     return_when=asyncio.FIRST_COMPLETED
                 )
                 
-                # Cancel remaining tasks
                 for task in pending:
                     task.cancel()
                     try:
@@ -389,44 +394,35 @@ Be concise and natural in voice. Answer in Indonesian language.""",
         
         except Exception as e:
             logger.error(f"Error handling voice client: {e}")
-            import traceback
-            traceback.print_exc()
         
         finally:
             logger.info("👤 Voice client disconnected")
     
     async def _handle_client_messages(self, websocket, session):
-        """Handle messages from web client"""
+        """Handle messages from web client (Streaming logic)"""
         
         try:
             async for message in websocket:
                 try:
-                    # Check if message is bytes (raw audio) or string (JSON)
                     if isinstance(message, bytes):
-                        # Raw audio data from MediaRecorder (WebM/Opus format)
-                        logger.info(f"📤 Sending raw audio ({len(message)} bytes)")
-                        # ✅ FIX: Use input= parameter
-                        await session.send(input=message, end_of_turn=True)
+                        # Audio Chunk: end_of_turn=False for streaming
+                        await session.send(
+                            input={"data": message, "mime_type": "audio/pcm"}, 
+                            end_of_turn=False 
+                        )
                     
                     elif isinstance(message, str):
-                        # JSON message
                         data = json.loads(message)
                         
-                        if data.get("type") == "text":
+                        if data.get("type") == "commit":
+                            # Stop speaking signal: end_of_turn=True to trigger response
+                            await session.send(input="", end_of_turn=True)
+                            logger.info("✅ Sent COMMIT signal to Gemini")
+
+                        elif data.get("type") == "text":
                             text = data["text"]
                             logger.info(f"📤 Sending text: {text}")
-                            # ✅ FIX: Use input= parameter
                             await session.send(input=text, end_of_turn=True)
-                        
-                        elif data.get("type") == "audio":
-                            # Base64-encoded audio
-                            audio_bytes = base64.b64decode(data["data"])
-                            logger.info(f"📤 Sending audio ({len(audio_bytes)} bytes)")
-                            # ✅ FIX: Use input= parameter
-                            await session.send(input=audio_bytes, end_of_turn=True)
-                    
-                    else:
-                        logger.warning(f"Unknown message type: {type(message)}")
                 
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid JSON from client: {e}")
@@ -437,18 +433,15 @@ Be concise and natural in voice. Answer in Indonesian language.""",
             logger.info("Voice client disconnected")
     
     async def _receive_from_gemini(self, session, websocket):
-        """Receive responses from Gemini Live"""
+        """Receive responses from Gemini Live (Streaming)"""
         
         audio_chunks = []
         
         try:
             async for response in session.receive():
                 try:
-                    # Handle audio response
                     if response.data:
                         audio_chunks.append(response.data)
-                        logger.info(f"📥 Received audio chunk ({len(response.data)} bytes), total: {len(audio_chunks)}")
-                        
                         audio_b64 = base64.b64encode(response.data).decode('utf-8')
                         await websocket.send(json.dumps({
                             "type": "response",
@@ -456,7 +449,6 @@ Be concise and natural in voice. Answer in Indonesian language.""",
                             "audio_format": "audio/pcm"
                         }))
                     
-                    # Handle text response
                     if response.text:
                         logger.info(f"📥 Received text: {response.text}")
                         await websocket.send(json.dumps({
@@ -464,22 +456,15 @@ Be concise and natural in voice. Answer in Indonesian language.""",
                             "text": response.text
                         }))
                     
-                    # ✅ FIX: Check for turn_complete (works for both audio-only and text responses)
                     if response.server_content and response.server_content.turn_complete:
                         logger.info(f"✅ Turn complete, sent {len(audio_chunks)} audio chunks")
-                        
-                        # Send turn_complete signal to frontend
                         await websocket.send(json.dumps({
                             "type": "response",
                             "turn_complete": True
                         }))
-                        
                         audio_chunks = []
                     
-                    # Handle tool calls
                     if response.tool_call:
-                        logger.info("🔧 Tool call received")
-                        
                         for fc in response.tool_call.function_calls:
                             function_name = fc.name
                             function_args = dict(fc.args) if fc.args else {}
@@ -494,14 +479,11 @@ Be concise and natural in voice. Answer in Indonesian language.""",
                             
                             if function_name == "query_transaction_history":
                                 result = query_transaction_history(**function_args)
-                                
                                 function_response = types.FunctionResponse(
                                     id=fc.id,
                                     name=fc.name,
                                     response=result
                                 )
-                                
-                                # ✅ FIX: Use input= parameter
                                 await session.send(input=function_response)
                                 logger.info(f"📤 Sent function response for {fc.id}")
                 
@@ -526,10 +508,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class ChatRequest(BaseModel):
-    message: str
-    user_id: Optional[str] = None
-
 class TransactionQueryRequest(BaseModel):
     query_type: str
     time_period: str
@@ -542,8 +520,8 @@ async def health_check():
     return {
         "status": "healthy",
         "services": {
-            "rest_api": "running",
-            "websocket_voice": "running on port 8765",
+            "rest_api": f"running on port {SINGLE_PORT}",
+            "websocket_voice": f"running on port {SINGLE_PORT}",
             "gemini_ai": "enabled"
         },
         "timestamp": datetime.now(JAKARTA_TZ).isoformat()
@@ -551,7 +529,6 @@ async def health_check():
 
 @app.post("/api/transactions/query")
 async def query_transactions(request: TransactionQueryRequest):
-    """Direct transaction query"""
     result = query_transaction_history(
         query_type=request.query_type,
         time_period=request.time_period,
@@ -563,7 +540,6 @@ async def query_transactions(request: TransactionQueryRequest):
 
 @app.get("/api/transactions/parse-date")
 async def parse_date(time_period: str = "today"):
-    """Test date parsing"""
     start, end = parse_time_reference_with_gemini(time_period)
     return {
         "time_period": time_period,
@@ -573,40 +549,83 @@ async def parse_date(time_period: str = "today"):
         "end_date_api_format": format_datetime_for_api(end)
     }
 
-# ==================== MAIN ====================
+# ==================== UNIFIED SERVER STARTUP (FIXED) ====================
 
-async def start_websocket_server():
-    """Start WebSocket server for voice"""
+async def handle_http_request(reader, writer):
+    """Handle standard HTTP requests (FastAPI) on the asyncio event loop."""
+    try:
+        config = uvicorn.Config(app, lifespan="off", log_level="warning")
+        protocol = uvicorn.protocols.http.h11_impl.H11Protocol(config=config, server_state={})
+        transport = type('Transport', (object,), {'close': writer.close})()
+        protocol.connection = transport
+        
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            protocol.data_received(data)
+            if protocol.h11_state == 'END':
+                break
+
+        response = await protocol.to_future
+        writer.write(response)
+        await writer.drain()
+    except Exception as e:
+        logger.error(f"HTTP handling error: {e}")
+    finally:
+        writer.close()
+
+
+async def application_server(host, port):
+    """
+    Starts two servers (HTTP and WebSocket) on the same host and port 
+    by binding to a single, shared socket to prevent OS error 48.
+    """
     handler = ClientWebSocketHandler()
-    async with websockets.serve(handler.handle_client, "0.0.0.0", 8765):
-        logger.info("✅ WebSocket server running on ws://localhost:8765")
-        await asyncio.Future()  # Run forever
+    loop = asyncio.get_running_loop()
+
+    # 1. Create a single TCP socket and configure it for reuse
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 
+    sock.bind((host, port))
+    sock.listen(500) # Listen on the socket
+
+    # 2. Start the HTTP server using the shared socket
+    http_server = await loop.create_server(
+        lambda: asyncio.StreamReaderProtocol(
+            asyncio.StreamReader(loop=loop), handle_http_request, loop=loop
+        ),
+        sock=sock,
+    )
+
+    # 3. Start the WebSocket server using the same shared socket
+    ws_server = await websockets.serve(
+        handler.handle_client, 
+        sock=sock, 
+        reuse_port=False 
+    )
+    
+    logger.info(f"✅ Unified server (HTTP/WS) running on http://{host}:{port}")
+    
+    async with http_server, ws_server:
+        await asyncio.gather(http_server.serve_forever(), ws_server.serve_forever())
+
 
 async def main():
-    """Run both FastAPI and WebSocket servers"""
-    import uvicorn
+    """Run the unified server startup."""
     
     print("\n" + "="*60)
-    print("🚀 BUKUWARUNG TRANSACTION HISTORY")
+    print("🚀 BUKUWARUNG TRANSACTION HISTORY - UNIFIED SERVER")
     print("="*60)
-    print("📡 REST API: http://localhost:9000")
-    print("📚 API Docs: http://localhost:9000/docs")
-    print("🎤 Voice WebSocket: ws://localhost:8765")
+    print(f"📡 REST/WS Unified Port: http://{HOST}:{SINGLE_PORT}")
+    print(f"📚 API Docs: http://{HOST}:{SINGLE_PORT}/docs (access might require direct HTTP client)")
     print("🤖 Powered by Gemini AI")
     print("="*60 + "\n")
     
-    # Start WebSocket server in background
-    websocket_task = asyncio.create_task(start_websocket_server())
-    
-    # Start FastAPI server (blocking)
-    config = uvicorn.Config(app, host="0.0.0.0", port=9000, log_level="info")
-    server = uvicorn.Server(config)
-    
     try:
-        await server.serve()
+        await application_server(HOST, SINGLE_PORT)
     except KeyboardInterrupt:
         print("\n👋 Shutting down servers...")
-        websocket_task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -5,7 +5,7 @@ services:
     build: .
     container_name: bukuwarung-voice-api
     ports:
-      - "8765:8765"
+      - "7070:7070"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - BUKUWARUNG_API_BASE=${BUKUWARUNG_API_BASE:-https://api-dev.bukuwarung.com/golden-gate/api/edc}

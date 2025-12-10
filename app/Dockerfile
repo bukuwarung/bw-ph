@@ -21,11 +21,11 @@ COPY . .
 RUN mkdir -p static
 
 # Expose ports
-EXPOSE 9000 8765
+EXPOSE 7070
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8765/health || exit 1
+    CMD curl -f http://localhost:7070/health || exit 1
 
 # Run the application
 CMD ["python", "app.py"]

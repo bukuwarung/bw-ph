@@ -1,4 +1,4 @@
-# <b>Sekar Transaction Voice API Documentation</b>
+# <b>Payment Transaction Voice API Documentation</b>
 
 **Version:** 1.0  
 **Base URL:** `http://localhost:8765`  
